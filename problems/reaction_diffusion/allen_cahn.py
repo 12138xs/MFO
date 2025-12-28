@@ -1,6 +1,6 @@
 import torch
 import h5py
-from problems.base import BaseTimeDataset
+from problems.base import BaseTimeDataset, get_channel_ids
 
 
 class AllenCahn(BaseTimeDataset):
@@ -26,6 +26,9 @@ class AllenCahn(BaseTimeDataset):
         self.input_dim = 1
         self.label_description = "[u]"
 
+        self.channel_names = ["u"]
+        self.channel_ids_tensor = get_channel_ids(self.channel_names)
+
         self.post_init()
 
     def __getitem__(self, idx):
@@ -50,4 +53,5 @@ class AllenCahn(BaseTimeDataset):
             "pixel_values": inputs,
             "labels": labels,
             "time": time,
+            "channel_ids": self.channel_ids_tensor,
         }

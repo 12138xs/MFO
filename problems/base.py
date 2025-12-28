@@ -13,6 +13,26 @@ from torch.utils.data import Dataset, ConcatDataset
 from accelerate.utils import broadcast_object_list
 
 
+PHYSICS_CHANNEL_MAP = {
+    "rho": 0,           # Density
+    "u": 1,             # Velocity X
+    "v": 2,             # Velocity Y
+    "p": 3,             # Pressure
+    "tracer": 4,        # Passive Tracer / Concentration
+    "c": 5,             # Scalar Field
+    "g": 6,             # Force
+    "w": 7,             # Velocity Z
+    "T": 8,             # Temperature
+    "E": 9,             # Energy
+    "vorticity": 10,    # Vorticity Magnitude
+    "unknown": 99       # Unknown Channel
+}
+
+def get_channel_ids(channel_names):
+    """Convert a list of channel names to a tensor of channel IDs."""
+    return torch.tensor([PHYSICS_CHANNEL_MAP.get(name, PHYSICS_CHANNEL_MAP["unknown"]) for name in channel_names], dtype=torch.long)
+
+
 class TextEmbeddingDataset(Dataset):
     def __init__(self, dataset, dataset_name):
         self.dataset = dataset

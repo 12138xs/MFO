@@ -1,55 +1,77 @@
 import torch
 from torch import nn
+from torch.nn import functional as F
 from transformers import Trainer
 from transformers.trainer_pt_utils import get_parameter_names
+from typing import Dict, Union, Any, Optional, Tuple, List
 
 class MoETrainer(Trainer):
-    def __init__(self, *args, aux_loss_weight=0.01, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.aux_loss_weight = aux_loss_weight # 负载均衡 Loss 的权重系数
+    """
+    Custom Trainer for Poseidon-MoE model.
+    Features:
+    1. Custom optimizer groups (separate LR for embeddings/heads vs. experts).
+    2. MoE Load Balancing Auxiliary Loss.
+    3. Autoregressive (AR) training loop support.
+    """
+
+    def __init__(self, model_args=None, aux_loss_weight=0.01, **kwargs):
+        super().__init__(**kwargs)
+        self.model_args = model_args
+        self.aux_loss_weight = aux_loss_weight
 
     def create_optimizer(self):
         """
-        自定义优化器分组，保持 Poseidon 的逻辑：
-        对 Embedding 和 Head 使用较大的学习率，对 Body (Experts) 使用较小的学习率。
+        Setup the optimizer.
+        We follow Poseidon's strategy:
+        - Encoder/Decoder (Embeddings & Heads): Higher learning rate (lr_embedding_recovery).
+        - Processor (MoE Experts): Base learning rate (args.learning_rate).
         """
         opt_model = self.model
+        
         if self.optimizer is None:
             decay_parameters = get_parameter_names(opt_model, [nn.LayerNorm])
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
             
-            # 分组逻辑
+            # Helper to check if param belongs to Encoder or Decoder
+            def is_embed_recovery(name):
+                return "encoder" in name or "decoder" in name
+
             optimizer_grouped_parameters = [
+                # Group 1: Core Body (Experts, Gating) - Weight Decay
                 {
                     "params": [
                         p for n, p in opt_model.named_parameters() 
-                        if (n in decay_parameters and "encoder" not in n and "decoder" not in n)
+                        if (n in decay_parameters and not is_embed_recovery(n) and p.requires_grad)
                     ],
                     "weight_decay": self.args.weight_decay,
+                    "lr": self.args.learning_rate,
                 },
+                # Group 2: Core Body - No Weight Decay (Bias, LayerNorm)
                 {
                     "params": [
                         p for n, p in opt_model.named_parameters() 
-                        if (n not in decay_parameters and "encoder" not in n and "decoder" not in n)
+                        if (n not in decay_parameters and not is_embed_recovery(n) and p.requires_grad)
                     ],
                     "weight_decay": 0.0,
+                    "lr": self.args.learning_rate,
                 },
-                # 为 Encoder 和 Decoder (Embeddings/Head) 设置特定的学习率 (通常更大)
+                # Group 3: Embeddings/Heads - Weight Decay - High LR
                 {
                     "params": [
                         p for n, p in opt_model.named_parameters() 
-                        if (n in decay_parameters and ("encoder" in n or "decoder" in n))
+                        if (n in decay_parameters and is_embed_recovery(n) and p.requires_grad)
                     ],
                     "weight_decay": self.args.weight_decay,
-                    "lr": self.args.learning_rate_embedding_recovery, 
+                    "lr": self.model_args.lr_embedding_recovery, 
                 },
+                # Group 4: Embeddings/Heads - No Weight Decay - High LR
                 {
                     "params": [
                         p for n, p in opt_model.named_parameters() 
-                        if (n not in decay_parameters and ("encoder" in n or "decoder" in n))
+                        if (n not in decay_parameters and is_embed_recovery(n) and p.requires_grad)
                     ],
                     "weight_decay": 0.0,
-                    "lr": self.args.learning_rate_embedding_recovery,
+                    "lr": self.model_args.lr_embedding_recovery,
                 },
             ]
 
@@ -58,146 +80,138 @@ class MoETrainer(Trainer):
 
         return self.optimizer
 
-    def _compute_moe_aux_loss(self, gate_weights):
+    def _compute_moe_aux_loss(self, gate_logits):
         """
-        计算负载均衡 Loss (Load Balancing Loss)
-        目标：使每个专家的使用率尽可能均匀。
-        
-        Args:
-            gate_weights: [Batch, Num_Patches, Top_K] (softmax 后的权重)
-                          或者如果模型返回的是 indices, 需要相应调整。
-                          这里假设模型返回的是 Softmax 后的 Top-K 权重。
+        Compute Load Balancing Loss based on Gate Logits.
+        Goal: Minimize the variance of expert usage to ensure all experts are utilized.
         """
-        if gate_weights is None:
+        if gate_logits is None:
             return 0.0
-            
-        # 1. 计算每个专家的平均重要性 (Importance)
-        # 展平 Batch 和 Patch 维度 -> [Total_Tokens, Top_K]
-        gate_weights = gate_weights.flatten(0, 1) 
         
-        # 这里是一个简化的负载均衡计算：
-        # 我们希望 batch 内的所有 token 能够平均分配到各个 Expert 上
-        # 由于我们只有 Top-K 的权重，我们可以通过计算权重的方差或变异系数来衡量不平衡度
+        # gate_logits shape: [Batch, Num_Patches, Num_Experts]
+        # 1. Convert logits to probabilities
+        probs = F.softmax(gate_logits, dim=-1)
         
-        # 但为了简单且有效，我们使用 "Importance Loss" 的简化版:
-        # Sum weights per expert over the batch
-        # 注意：这里需要知道 Expert 总数，我们可以从 model config 获取
-        num_experts = self.model.config.num_experts
+        # 2. Calculate "Importance" (Sum of probabilities assigned to each expert across the batch)
+        # Shape: [Num_Experts]
+        expert_importance = probs.sum(dim=(0, 1))
         
-        # 由于 gate_weights 只有 Top-K，我们需要把它映射回 [Total_Tokens, Num_Experts] 的稀疏矩阵比较麻烦
-        # 这里采用一种估算：最小化 Top-K 权重的方差是不够的，我们需要确保所有 Expert 都被选中。
+        # 3. Calculate target distribution (Uniform)
+        num_experts = expert_importance.shape[0]
+        total_weight = expert_importance.sum()
+        target_importance = torch.ones_like(expert_importance) * (total_weight / num_experts)
         
-        # 简单方案：如果模型能返回 logits 最好，如果只返回了 weights (Top-K)，
-        # 我们很难精确计算标准的 Switch Transformer Loss。
-        # 这里假设 gate_weights 实际上是所有 expert 的 logits 或者 full probabilities
-        # 如果不是，建议修改 model 返回 full probabilities。
+        # 4. Compute MSE between actual importance and uniform target
+        # Alternatively, we could use Coefficient of Variation (CV) squared
+        aux_loss = F.mse_loss(expert_importance, target_importance)
         
-        # 临时方案：假设 batch 足够大，Top-K 的 sum 应该趋于均匀
-        # 但既然这很难精确，我们这里先返回 0，请务必在 Model 中实现 Aux Loss 并返回，
-        # 或者修改 Model 返回完整的 gate_probs [B, N, Num_Experts]
-        
-        # **修正策略**: 
-        # 假设 gate_weights 就是 [B, N, Num_Experts] 的完整概率分布 (Soft Routing)
-        # 或者我们修改 Model 输出 indices。
-        
-        # 让我们假设 Model 返回的是 full probabilities [B, N, Num_Experts] (Soft MoE)
-        # 或者我们只对选中的权重做惩罚 (熵最大化)
-        
-        # 这里给出一个通用的 变异系数 Loss (CV Squared):
-        # expert_load = gate_weights.sum(0).sum(0) # [Num_Experts] (如果 tensor 是全量的)
-        
-        return 0.0 # 占位，建议在 Model forward 内部计算并返回，见下方说明。
+        return aux_loss
 
-    def _model_forward(self, model, pixel_values, pixel_mask, text_embedding, labels=None):
+    def _model_forward(self, model, pixel_values, pixel_mask, text_embedding, channel_ids, labels=None):
         """
-        处理自回归 (Autoregressive) 前向传播和 Loss 计算
+        Autoregressive forward pass logic.
         """
-        # 1. 获取 AR 步数 (默认 1)
-        ar_steps = self.args.ar_steps if hasattr(self.args, "ar_steps") else 1
+        # Get AR steps from args (default to 1 if not present)
+        ar_steps = self.model_args.ar_steps if hasattr(self.model_args, "ar_steps") else 1
         
-        total_loss = 0
+        total_rec_loss = 0.0
+        total_aux_loss = 0.0
+        
+        # Current input state for the loop
         current_input = pixel_values
         
-        # 循环预测未来多步
+        # Loop for AR steps
         for step in range(ar_steps):
-            # 获取当前步的标签 (labels 应该是 [B, T, C, H, W] 或 list of tensors)
-            # Poseidon 的 Dataset 通常返回的是下一时刻的单步 label。
-            # 如果 ar_steps > 1，Dataset 应该设计为返回序列。
-            # 这里为了兼容现有 Poseidon 逻辑 (通常 ar_steps=1)，我们假设 labels 就是下一步
-            
-            if ar_steps == 1:
-                step_label = labels
+            # Determine label for this step
+            # Note: Poseidon datasets typically return the *next* step as 'labels'.
+            # If ar_steps > 1, the dataset should ideally provide a sequence of labels.
+            # Here we assume single-step label is reused (limit of current dataset) 
+            # OR logic handles sequence if labels has extra dim.
+            if labels is not None:
+                if labels.ndim > current_input.ndim: 
+                    # If labels is [B, T, C, H, W]
+                    step_label = labels[:, step]
+                else:
+                    # If labels is [B, C, H, W] (Standard Poseidon), only valid for step 0
+                    # For step > 0, we technically don't have GT, so we might stop loss calc
+                    # or assume the physics is stationary (wrong).
+                    # For safety: We calculate loss against the provided label.
+                    step_label = labels
             else:
-                # 如果要做多步 AR，Dataset 结构需要配合修改，这里简化处理只取一步
-                step_label = labels 
+                step_label = None
 
-            # 模型前向
-            # 注意：传入 text_embedding
-            output, gate_weights = model(
+            # Forward pass
+            # Returns: (output, gate_logits)
+            output, gate_logits = model(
                 pixel_values=current_input,
                 pixel_mask=pixel_mask,
-                text_embedding=text_embedding
+                text_embedding=text_embedding,
+                channel_ids=channel_ids
             )
             
-            # --- 1. Reconstruction Loss (物理场重建) ---
-            # 扩展 mask 以匹配输出形状 [B, C, H, W]
-            B, C, H, W = output.shape
-            mask_expanded = pixel_mask.view(B, C, 1, 1)
-            
-            # 根据配置选择 L1 或 MSE
-            if self.model.config.loss_type == "l1":
-                rec_loss = nn.functional.l1_loss(output, step_label, reduction='none')
-            else:
-                rec_loss = nn.functional.mse_loss(output, step_label, reduction='none')
-            
-            # Apply Mask & Average
-            rec_loss = (rec_loss * mask_expanded).sum() / (mask_expanded.sum() * H * W + 1e-6)
-            
-            # --- 2. MoE Load Balancing Loss ---
-            # 建议：在 model.py 的 MoEProcessor 中计算 Loss 更方便，因为那里有 indices
-            # 这里假设 gate_weights 包含了计算好的 aux loss，或者我们手动计算
-            # 简单起见，我们计算 gate_weights (probabilities) 的熵或方差
-            
-            # 假设 gate_weights 是 [B, N, Num_Experts] 的完整概率
-            # 负载均衡 Loss = expert_usage_variance
-            if gate_weights is not None:
-                # Sum over batch and spatial tokens -> [Num_Experts]
-                expert_usage = gate_weights.sum(dim=(0, 1)) 
-                # Normalize
-                expert_usage = expert_usage / (expert_usage.sum() + 1e-6)
-                # 我们希望它是均匀分布 (1/N)
-                target_usage = torch.ones_like(expert_usage) / expert_usage.numel()
-                aux_loss = nn.functional.mse_loss(expert_usage, target_usage)
-            else:
-                aux_loss = 0.0
+            # --- 1. Reconstruction Loss ---
+            if step_label is not None:
+                # Expand mask for broadcasting: [B, C] -> [B, C, 1, 1]
+                B, C, H, W = output.shape
+                mask_expanded = pixel_mask.view(B, C, 1, 1)
+                
+                if self.model_args.loss_type == "l1":
+                    loss_fn = F.l1_loss
+                else:
+                    loss_fn = F.mse_loss
+                
+                # Compute raw loss
+                rec_loss = loss_fn(output, step_label, reduction='none')
+                
+                # Apply mask (ignore padding channels) and Normalize
+                # Only average over valid pixels
+                valid_elements = mask_expanded.sum() * H * W
+                rec_loss = (rec_loss * mask_expanded).sum() / (valid_elements + 1e-6)
+                
+                total_rec_loss += rec_loss
 
-            # --- Total Loss ---
-            step_loss = rec_loss + self.aux_loss_weight * aux_loss
-            total_loss += step_loss
+            # --- 2. Aux Loss (Load Balancing) ---
+            aux_loss = self._compute_moe_aux_loss(gate_logits)
+            total_aux_loss += aux_loss
             
-            # 准备下一步输入 (Detached to save memory if needed, but usually kept for BPTT)
-            # 在 PDE 中通常保留梯度
+            # Update input for next step (Autoregressive)
+            # We keep the graph connected for BPTT
             current_input = output
 
-        return total_loss / ar_steps, output
+        # Average losses over AR steps
+        avg_rec_loss = total_rec_loss / ar_steps
+        avg_aux_loss = total_aux_loss / ar_steps
+        
+        # Weighted sum
+        total_loss = avg_rec_loss + self.aux_loss_weight * avg_aux_loss
+        
+        # For logging, we might want to see the breakdown, but Trainer expects single scalar
+        # We return the output of the LAST step
+        return total_loss, output
 
     def compute_loss(self, model, inputs, return_outputs=False):
         """
-        重写 compute_loss 以解包 inputs 字典
+        Override compute_loss to handle custom input unpacking and custom forward logic.
         """
-        # 从 inputs 字典中提取数据
+        # Unpack inputs from the collator dictionary
         pixel_values = inputs.get("pixel_values")
         pixel_mask = inputs.get("pixel_mask")
         labels = inputs.get("labels")
-        text_embedding = inputs.get("text_embedding") # 或者是 input_ids
+        text_embedding = inputs.get("text_embedding")
+        channel_ids = inputs.get("channel_ids")
         
-        # 兼容性处理：如果是 input_ids (未预计算 Embedding)
-        if text_embedding is None and "input_ids" in inputs:
-            # 这种情况下模型需要自己 forward text_encoder
-            # 但我们在 model.py 里约定了直接传 text_embedding
-            # 假设 Dataset 已经做好了
-            pass
+        # Check mandatory inputs
+        if pixel_values is None or text_embedding is None:
+             raise ValueError("pixel_values and text_embedding are required.")
 
-        loss, outputs = self._model_forward(model, pixel_values, pixel_mask, text_embedding, labels)
+        # Forward pass with AR logic
+        loss, outputs = self._model_forward(
+            model, 
+            pixel_values, 
+            pixel_mask, 
+            text_embedding, 
+            channel_ids, 
+            labels
+        )
         
         return (loss, outputs) if return_outputs else loss

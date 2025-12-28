@@ -1,6 +1,6 @@
 import torch
 import h5py
-from problems.base import BaseTimeDataset
+from problems.base import BaseTimeDataset, get_channel_ids
 
 
 class Layer(BaseTimeDataset):
@@ -27,6 +27,9 @@ class Layer(BaseTimeDataset):
 
         self.input_dim = 2
         self.label_description = "[u],[c]"
+
+        self.channel_names = ["u", "c"]
+        self.channel_ids_tensor = get_channel_ids(self.channel_names)
 
         self.post_init()
 
@@ -61,6 +64,7 @@ class Layer(BaseTimeDataset):
             "pixel_values": inputs,
             "labels": labels,
             "time": time,
+            "channel_ids": self.channel_ids_tensor,
         }
 
 
@@ -89,6 +93,9 @@ class Gaussians(BaseTimeDataset):
         self.input_dim = 2
         self.label_description = "[u],[c]"
 
+        self.channel_names = ["u", "c"]
+        self.channel_ids_tensor = get_channel_ids(self.channel_names)
+
         self.post_init()
 
     def __getitem__(self, idx):
@@ -122,4 +129,5 @@ class Gaussians(BaseTimeDataset):
             "pixel_values": inputs,
             "labels": labels,
             "time": time,
+            "channel_ids": self.channel_ids_tensor,
         }

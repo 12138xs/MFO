@@ -2,7 +2,7 @@ import torch
 import os
 import h5py
 import numpy as np
-from problems.base import BaseDataset
+from problems.base import BaseDataset, get_channel_ids
 
 
 class Helmholtz(BaseDataset):
@@ -26,6 +26,9 @@ class Helmholtz(BaseDataset):
         self.input_dim = 2
         self.label_description = "[u]"
 
+        self.channel_names = ["u"]
+        self.channel_ids_tensor = get_channel_ids(self.channel_names)
+
         self.post_init()
 
     def __getitem__(self, idx):
@@ -46,4 +49,4 @@ class Helmholtz(BaseDataset):
         )
         labels = (labels - self.mean) / self.std
 
-        return {"pixel_values": inputs, "labels": labels}
+        return {"pixel_values": inputs, "labels": labels, "channel_ids": self.channel_ids_tensor}

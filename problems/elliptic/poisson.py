@@ -1,7 +1,7 @@
 import torch
 import os
 import h5py
-from problems.base import BaseDataset
+from problems.base import BaseDataset, get_channel_ids
 
 CONSTANTS = {
     "mean_source": 0.014822142414492256,
@@ -27,6 +27,9 @@ class Gaussians(BaseDataset):
         self.input_dim = 1
         self.label_description = "[u]"
 
+        self.channel_names = ["u"]
+        self.channel_ids_tensor = get_channel_ids(self.channel_names)
+
         self.post_init()
 
     def __getitem__(self, idx):
@@ -47,4 +50,4 @@ class Gaussians(BaseDataset):
             "std_solution"
         ]
 
-        return {"pixel_values": inputs, "labels": labels}
+        return {"pixel_values": inputs, "labels": labels, "channel_ids": self.channel_ids_tensor}

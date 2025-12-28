@@ -1,7 +1,7 @@
 import torch
 import h5py
 import copy
-from problems.base import BaseTimeDataset, BaseDataset
+from problems.base import BaseTimeDataset, BaseDataset, get_channel_ids
 from problems.fluids.normalization_constants import CONSTANTS
 
 
@@ -25,6 +25,9 @@ class Airfoil(BaseDataset):
 
         self.input_dim = 1
         self.label_description = "[rho]"
+
+        self.channel_names = ["rho"]
+        self.channel_ids_tensor = get_channel_ids(self.channel_names)
 
         self.post_init()
 
@@ -50,6 +53,7 @@ class Airfoil(BaseDataset):
             "pixel_values": inputs,
             "labels": labels,
             "pixel_mask": pixel_mask,
+            "channel_ids": self.channel_ids_tensor,
         }
 
 
@@ -82,6 +86,9 @@ class RichtmyerMeshkov(BaseTimeDataset):
 
         self.pixel_mask = torch.tensor([False, False, False, False])
 
+        self.channel_names = ["rho", "u", "v", "p"]
+        self.channel_ids_tensor = get_channel_ids(self.channel_names)
+
         self.post_init()
 
     def __getitem__(self, idx):
@@ -108,6 +115,7 @@ class RichtmyerMeshkov(BaseTimeDataset):
             "labels": label,
             "time": time,
             "pixel_mask": self.pixel_mask,
+            "channel_ids": self.channel_ids_tensor,
         }
 
 
@@ -143,6 +151,9 @@ class RayleighTaylor(BaseTimeDataset):
         self.label_description = "[rho],[u,v],[p],[g]"
 
         self.pixel_mask = torch.tensor([False, False, False, False, False])
+
+        self.channel_names = ["rho", "u", "v", "p", "g"]
+        self.channel_ids_tensor = get_channel_ids(self.channel_names)
 
         self.post_init()
 
@@ -185,6 +196,7 @@ class RayleighTaylor(BaseTimeDataset):
             "labels": label,
             "time": time,
             "pixel_mask": self.pixel_mask,
+            "channel_ids": self.channel_ids_tensor,
         }
 
 
@@ -215,6 +227,13 @@ class CompressibleBase(BaseTimeDataset):
             if not tracer
             else torch.tensor([False, False, False, False, False])
         )
+
+        self.channel_names = (
+            ["rho", "u", "v", "p"]
+            if not tracer
+            else ["rho", "u", "v", "p", "tracer"]
+        )
+        self.channel_ids_tensor = get_channel_ids(self.channel_names)
 
         self.post_init()
 
@@ -258,6 +277,7 @@ class CompressibleBase(BaseTimeDataset):
             "labels": label,
             "time": time,
             "pixel_mask": self.pixel_mask,
+            "channel_ids": self.channel_ids_tensor,
         }
 
 

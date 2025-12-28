@@ -2,7 +2,7 @@ import torch
 import h5py
 import numpy as np
 import copy
-from problems.base import BaseTimeDataset
+from problems.base import BaseTimeDataset, get_channel_ids
 from problems.fluids.normalization_constants import CONSTANTS
 
 
@@ -69,6 +69,13 @@ class IncompressibleBase(BaseTimeDataset):
             if resolution > 128:
                 raise ValueError("Resolution must be <= 128")
             self.res = resolution
+
+        self.channel_names = ["u", "v"]
+        if not self.just_velocities:
+            self.channel_names = ["rho", "u", "v", "p"]
+        if self.tracer:
+            self.channel_names.append("tracer")
+        self.channel_ids_tensor = get_channel_ids(self.channel_names)
 
         self.post_init()
 
@@ -143,6 +150,7 @@ class IncompressibleBase(BaseTimeDataset):
             "labels": label,
             "time": time,
             "pixel_mask": self.pixel_mask,
+            "channel_ids": self.channel_ids_tensor,
         }
 
 
@@ -205,6 +213,13 @@ class KolmogorovFlow(BaseTimeDataset):
                 dim=0,
             )
 
+        self.channel_names = ["u", "v", "g"]
+        if not self.just_velocities:
+            self.channel_names = ["rho", "u", "v", "p", "g"]
+        if self.tracer:
+            self.channel_names.append("tracer")
+        self.channel_ids_tensor = get_channel_ids(self.channel_names)
+
         self.post_init()
 
     def __getitem__(self, idx):
@@ -240,6 +255,7 @@ class KolmogorovFlow(BaseTimeDataset):
             "labels": label,
             "time": time,
             "pixel_mask": self.pixel_mask,
+            "channel_ids": self.channel_ids_tensor,
         }
 
 
