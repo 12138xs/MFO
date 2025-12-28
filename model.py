@@ -22,7 +22,7 @@ class MoEConfig(PretrainedConfig):
                  embed_dim=128,         # Hidden embedding dimension
                  text_dim=768,          # Dimension of text embeddings
                  max_num_channels=256,  # Max number of physical channels supported
-                 num_experts=4,         # Total number of experts
+                 num_experts=7,         # Total number of experts (Expanded to 7 types)
                  top_k=2,               # Number of experts activated per token
                  fno_modes=16,          # Number of Fourier modes for FNO expert
                  swin_window_size=8,    # Window size for Window Attention expert
@@ -105,9 +105,10 @@ class ChannelAwarePatchEncoder(nn.Module):
         return x
 
 # ==========================================
-# 3. Experts
+# 3. Base Experts (FNO, MLP, Swin)
 # ==========================================
 
+# --- FNO Expert ---
 class SpectralConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, modes1, modes2):
         super().__init__()
@@ -168,6 +169,7 @@ class FNOExpert(nn.Module):
         out = out.flatten(2).transpose(1, 2)
         return out + x 
 
+# --- MLP Expert ---
 class MLPExpert(nn.Module):
     def __init__(self, config: MoEConfig):
         super().__init__()
@@ -188,6 +190,7 @@ class MLPExpert(nn.Module):
         x = self.drop(x)
         return x + shortcut
 
+# --- Swin/Window Attention Expert ---
 class WindowAttentionExpert(nn.Module):
     def __init__(self, config: MoEConfig):
         super().__init__()
@@ -239,7 +242,190 @@ class WindowAttentionExpert(nn.Module):
         return x
 
 # ==========================================
-# 4. MoE Processor
+# 4. New Experts (OFormer, UNet, KNO, WNO)
+# ==========================================
+
+# --- OFormer Expert (Galerkin Attention) ---
+class GalerkinAttention(nn.Module):
+    def __init__(self, dim, num_heads=4, qkv_bias=False, attn_drop=0.0, proj_drop=0.0):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+        self.dim = dim
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.proj_drop = nn.Dropout(proj_drop)
+        
+        self.ln_k = nn.LayerNorm(head_dim)
+        self.ln_v = nn.LayerNorm(head_dim)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        
+        k = self.ln_k(k)
+        v = self.ln_v(v)
+        
+        k_t = k.transpose(-2, -1)
+        # Linear complexity global attention: Q @ (K^T @ V)
+        context = torch.matmul(k_t, v) 
+        x = torch.matmul(q, context)
+        
+        x = x * self.scale
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+class OFormerExpert(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dim = config.embed_dim
+        self.norm1 = nn.LayerNorm(self.dim)
+        self.attn = GalerkinAttention(self.dim, num_heads=4)
+        self.norm2 = nn.LayerNorm(self.dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.dim, int(self.dim * config.mlp_ratio)),
+            nn.GELU(),
+            nn.Linear(int(self.dim * config.mlp_ratio), self.dim)
+        )
+        
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+# --- U-Net Expert ---
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(4, out_channels), 
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(4, out_channels),
+            nn.GELU()
+        )
+
+    def forward(self, x):
+        return self.double_conv(x)
+
+class UNetExpert(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dim = config.embed_dim
+        
+        # Downsampling
+        self.inc = DoubleConv(self.dim, self.dim)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(self.dim, self.dim * 2))
+        
+        # Bottleneck
+        self.bot = DoubleConv(self.dim * 2, self.dim * 2)
+        
+        # Upsampling
+        self.up1 = nn.ConvTranspose2d(self.dim * 2, self.dim, kernel_size=2, stride=2)
+        self.outc = DoubleConv(self.dim * 2, self.dim)
+        
+        # 1x1 conv mix
+        self.final = nn.Conv2d(self.dim, self.dim, kernel_size=1)
+
+    def forward(self, x):
+        B, N, D = x.shape
+        H = W = int(N**0.5)
+        
+        x_img = x.transpose(1, 2).view(B, D, H, W)
+        
+        x1 = self.inc(x_img)         
+        x2 = self.down1(x1)          
+        x3 = self.bot(x2)            
+        x_up = self.up1(x3)          
+        
+        x_cat = torch.cat([x1, x_up], dim=1)
+        x_out = self.outc(x_cat)
+        x_out = self.final(x_out)
+        
+        x_out = x_out.flatten(2).transpose(1, 2)
+        return x + x_out 
+
+# --- KNO Expert (Koopman) ---
+class KNOExpert(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dim = config.embed_dim
+        self.lift_dim = self.dim * 2 
+        
+        self.lift = nn.Linear(self.dim, self.lift_dim)
+        self.dynamics = nn.Linear(self.lift_dim, self.lift_dim)
+        self.act = nn.GELU()
+        self.proj = nn.Linear(self.lift_dim, self.dim)
+
+    def forward(self, x):
+        shortcut = x
+        x = self.lift(x)
+        x = self.act(x)
+        x = self.dynamics(x) # Linear dynamic evolution
+        x = self.act(x)
+        x = self.proj(x)
+        return x + shortcut
+
+# --- WNO Expert (Wavelet) ---
+class HaarWavelet2d(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.in_channels = in_channels
+        self.register_buffer('filters', torch.tensor([
+            [[0.5, 0.5], [0.5, 0.5]],      # LL
+            [[0.5, -0.5], [0.5, -0.5]],    # LH 
+            [[0.5, 0.5], [-0.5, -0.5]],    # HL 
+            [[0.5, -0.5], [-0.5, 0.5]]     # HH 
+        ]).unsqueeze(1).repeat(in_channels, 1, 1, 1))
+        
+        self.register_buffer('inv_filters', torch.tensor([
+            [[0.5, 0.5], [0.5, 0.5]],      
+            [[0.5, -0.5], [0.5, -0.5]],    
+            [[0.5, 0.5], [-0.5, -0.5]],    
+            [[0.5, -0.5], [-0.5, 0.5]]     
+        ]).unsqueeze(1).repeat(in_channels, 1, 1, 1)) 
+
+    def forward(self, x):
+        return F.conv2d(x, self.filters, stride=2, groups=self.in_channels)
+
+    def inverse(self, x):
+        return F.conv_transpose2d(x, self.inv_filters, stride=2, groups=self.in_channels)
+
+class WNOExpert(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dim = config.embed_dim
+        self.wavelet = HaarWavelet2d(self.dim)
+        
+        # Process 4 bands (LL, LH, HL, HH)
+        self.conv = nn.Sequential(
+            nn.Conv2d(self.dim * 4, self.dim * 4, kernel_size=3, padding=1, groups=4),
+            nn.GELU(),
+            nn.Conv2d(self.dim * 4, self.dim * 4, kernel_size=1)
+        )
+        self.mixing = nn.Linear(self.dim, self.dim)
+
+    def forward(self, x):
+        B, N, D = x.shape
+        H = W = int(N**0.5)
+        x_img = x.transpose(1, 2).view(B, D, H, W)
+        
+        x_freq = self.wavelet(x_img)
+        x_processed = self.conv(x_freq)
+        x_recon = self.wavelet.inverse(x_processed)
+        
+        x_out = x_recon.flatten(2).transpose(1, 2)
+        return x + self.mixing(x_out)
+
+# ==========================================
+# 5. MoE Processor
 # ==========================================
 
 class TopKGating(nn.Module):
@@ -266,9 +452,13 @@ class MoEProcessor(nn.Module):
         self.config = config
         
         self.experts = nn.ModuleList([
-            FNOExpert(config),             # Expert 0
-            MLPExpert(config),             # Expert 1
-            WindowAttentionExpert(config)  # Expert 2
+            FNOExpert(config),             # Expert 0: Fourier
+            MLPExpert(config),             # Expert 1: MLP
+            WindowAttentionExpert(config), # Expert 2: Swin
+            OFormerExpert(config),         # Expert 3: Galerkin Attention
+            UNetExpert(config),            # Expert 4: U-Net
+            KNOExpert(config),             # Expert 5: Koopman
+            WNOExpert(config)              # Expert 6: Wavelet
         ])
         
         current_experts = len(self.experts)
@@ -284,19 +474,23 @@ class MoEProcessor(nn.Module):
         
         final_output = torch.zeros_like(x)
         
+        # Dense execution (Run all experts to avoid DDP unused params error)
+        # Multiply by mask at the end.
         for k_idx in range(self.config.top_k):
             idx = indices[:, k_idx] 
             w = weights[:, k_idx].view(B, 1, 1)
+            
             for expert_idx, expert in enumerate(self.experts):
                 mask = (idx == expert_idx).view(B, 1, 1).float()
-                if mask.sum() > 0:
-                    expert_out = expert(x)
-                    final_output = final_output + w * expert_out * mask
+                # Run expert regardless of mask (for DDP stability)
+                expert_out = expert(x)
+                # Zero out if not selected
+                final_output = final_output + w * expert_out * mask
         
         return final_output, logits
 
 # ==========================================
-# 5. Decoder
+# 6. Decoder
 # ==========================================
 
 class QueryBasedDecoder(nn.Module):
@@ -338,7 +532,7 @@ class QueryBasedDecoder(nn.Module):
         return x_recon
 
 # ==========================================
-# 6. Main Model: PoseidonMoE
+# 7. Main Model: PoseidonMoE
 # ==========================================
 
 class PoseidonMoE(PreTrainedModel):
@@ -377,7 +571,7 @@ class PoseidonMoE(PreTrainedModel):
                 pixel_values: torch.Tensor, 
                 text_embedding: torch.Tensor, 
                 pixel_mask: torch.Tensor, 
-                channel_ids: Optional[torch.Tensor] = None,
+                channel_ids: Optional[torch.Tensor] = None, 
                 labels: Optional[torch.Tensor] = None,
                 **kwargs):
         
