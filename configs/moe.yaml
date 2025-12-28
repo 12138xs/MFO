@@ -1,38 +1,44 @@
-# configs/moe.yaml
-
-# --- Model Architecture (架构参数) ---
+# --- Model Architecture ---
 img_size: 128
 patch_size: 4
-embed_dim: 128            # 隐层维度
-text_dim: 768             # 文本向量维度
-num_experts: 4            # 专家数量
-top_k: 2                  # 激活专家数
-fno_modes: 16             # FNO 模态数
-swin_window_size: 8       # Window Attention 窗口大小
-swin_num_heads: 4         # Attention 头数
-mlp_ratio: 4.0            # MLP 膨胀比
-max_num_channels: 256     # 物理通道 Embedding 字典大小 (关键修正)
+embed_dim: 128
+text_dim: 768
+num_experts: 4
+top_k: 2
+fno_modes: 16
+swin_window_size: 8
+swin_num_heads: 4
+mlp_ratio: 4.0
+max_num_channels: 256
 
-# --- Loss & Optimization (损失与优化) ---
-aux_loss_weight: 0.01          # 负载均衡 Loss 权重
-loss_type: "mse"               # 损失函数类型
-lr_embedding_recovery: 1.0e-3  # 输入输出层的大习率 (关键修正)
+# --- Loss & Optimization ---
+aux_loss_weight: 0.01
+loss_type: "mse"
+lr_embedding_recovery: 1.0e-3
 
-# --- Data Arguments (数据参数) ---
-dataset_name: "fluids.incompressible.Gaussians" 
-data_path: "/data1/cenjianhuan/UniPDESolver/datasets"       
-max_train_samples: null   # 可设置为具体数值如 1000 用于调试
+# --- Data Arguments ---
+dataset_name: [
+  "fluids.incompressible.Gaussians", 
+  "fluids.incompressible.Sines", 
+  "fluids.compressible.Riemann",
+  "fluids.compressible.RiemannCurved",
+  "fluids.compressible.KelvinHelmholtz",
+  "fluids.compressible.Gaussians"
+] 
+data_path: "/data1/cenjianhuan/UniPDESolver/datasets/"       
+max_train_samples: null
 max_eval_samples: null
-ar_steps: 1               # 自回归步数
+ar_steps: 1
 
-# --- Training Arguments (HuggingFace Trainer 参数) ---
+# --- Training Arguments ---
 output_dir: "./checkpoints/moe_run_final"
-overwrite_output_dir: true
+overwrite_output_dir: false     # 【关键修改】设为 false 以支持断点续训
 do_train: true
 do_eval: true
 
 # Optimization
-learning_rate: 5.0e-4     # 核心层(Experts)的学习率
+learning_rate: 5.0e-4
+optim: "adamw_torch"
 weight_decay: 1.0e-4
 lr_scheduler_type: "cosine"
 warmup_ratio: 0.05
@@ -42,18 +48,21 @@ num_train_epochs: 50
 per_device_train_batch_size: 8
 per_device_eval_batch_size: 8
 gradient_accumulation_steps: 1
-fp16: false                     # 【关键】禁用半精度 (按要求)
-bf16: false                     # 【关键】禁用 bf16
+fp16: false
+bf16: false
 
 # Logging & Saving
 logging_steps: 50
-save_steps: 500
-eval_steps: 500
-evaluation_strategy: "steps"
-save_total_limit: 3
-load_best_model_at_end: true
+
+# 【关键修改】策略调整为 epoch，且只保留最新的1个 + 最优的1个
+evaluation_strategy: "epoch"
+save_strategy: "epoch"
+save_total_limit: 1             # 只保留1个最新的 checkpoint
+load_best_model_at_end: true    # 训练结束加载最优模型（并确保最优chkpt不被删除）
+metric_for_best_model: "eval_loss" # 根据 loss 选最优
+greater_is_better: false        # loss 越小越好
 
 # System
 seed: 42
 dataloader_num_workers: 4
-remove_unused_columns: false    # 必须为 false 以保留 text_embedding 等列
+remove_unused_columns: false
