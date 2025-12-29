@@ -6,6 +6,38 @@ from typing import Optional, Tuple, Union
 from transformers import PretrainedConfig, PreTrainedModel
 
 # ==========================================
+# 0. Conditional Layer Norm (Time Conditioning)
+# ==========================================
+
+class ConditionalLayerNorm(nn.Module):
+    """
+    Poseidon-style LayerNorm that adapts based on time step size.
+    """
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        # Maps time scalar to feature dimension scaling and shifting
+        self.weight = nn.Linear(1, dim)
+        self.bias = nn.Linear(1, dim)
+
+    def forward(self, x, time):
+        # x: [B, ..., D]
+        # time: [B]
+        mean = x.mean(dim=-1, keepdim=True)
+        var = (x**2).mean(dim=-1, keepdim=True) - mean**2
+        x = (x - mean) / (var + self.eps).sqrt()
+        
+        # Reshape time for broadcasting: [B, 1, ..., 1, D]
+        t = time.reshape(-1, 1).type_as(x)
+        
+        # Generate dynamic weights and biases
+        # View them to match x's dimensions except for the batch and feature dim
+        w = self.weight(t).view(-1, *([1]*(x.dim()-2)), x.shape[-1])
+        b = self.bias(t).view(-1, *([1]*(x.dim()-2)), x.shape[-1])
+        
+        return w * x + b
+
+# ==========================================
 # 1. Configuration Class
 # ==========================================
 
@@ -96,12 +128,14 @@ class ChannelAwarePatchEncoder(nn.Module):
         self.channel_pos_embed = nn.Embedding(config.max_num_channels, config.embed_dim)
         self.spatial_pos_embed = nn.Parameter(torch.zeros(1, config.num_patches, config.embed_dim))
         self.text_proj = nn.Linear(config.text_dim, config.embed_dim)
-        self.norm = nn.LayerNorm(config.embed_dim)
+        
+        # [CHANGE] Use ConditionalLayerNorm
+        self.norm = ConditionalLayerNorm(config.embed_dim)
         
         nn.init.trunc_normal_(self.spatial_pos_embed, std=0.02)
         nn.init.trunc_normal_(self.channel_pos_embed.weight, std=0.02)
 
-    def forward(self, pixel_values, pixel_mask, text_embedding, channel_ids=None):
+    def forward(self, pixel_values, pixel_mask, text_embedding, time, channel_ids=None):
         B, C, H, W = pixel_values.shape
         N = self.config.num_patches
         
@@ -126,14 +160,15 @@ class ChannelAwarePatchEncoder(nn.Module):
         text_feat = self.text_proj(text_embedding).unsqueeze(1)
         x = x_agg + text_feat
         
-        x = self.norm(x)
+        # [CHANGE] Pass time to norm
+        x = self.norm(x, time)
         return x
 
 # ==========================================
 # 3. Experts
 # ==========================================
 
-# --- FNO Expert (Refactored to Block Stacking) ---
+# --- FNO Expert ---
 class SpectralConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, modes1, modes2):
         super().__init__()
@@ -143,7 +178,6 @@ class SpectralConv2d(nn.Module):
         self.modes2 = modes2
         self.scale = (1 / (in_channels * out_channels))
         
-        # Real and Imaginary parts split for NCCL compatibility
         self.weights1 = nn.Parameter(
             self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, 2, dtype=torch.float32)
         )
@@ -169,9 +203,6 @@ class SpectralConv2d(nn.Module):
         return x
 
 class FNOBlock(nn.Module):
-    """
-    Standard FNO Block: SpectralConv -> Skip -> Act
-    """
     def __init__(self, config):
         super().__init__()
         self.dim = config.embed_dim
@@ -180,14 +211,23 @@ class FNOBlock(nn.Module):
         self.conv = SpectralConv2d(self.dim, self.dim, self.modes, self.modes)
         self.w = nn.Conv2d(self.dim, self.dim, 1)
         self.act = nn.GELU()
-        # Add norm for stability in deep FNOs
-        self.norm = nn.LayerNorm(self.dim) 
+        # [CHANGE] Use ConditionalLayerNorm
+        self.norm = ConditionalLayerNorm(self.dim) 
 
-    def forward(self, x_grid):
+    def forward(self, x_grid, time):
         # x_grid: [B, D, H, W]
         x1 = self.conv(x_grid)
         x2 = self.w(x_grid)
-        out = self.act(x1 + x2)
+        
+        # Norm in Poseidon style: usually on channels last.
+        # Permute [B, D, H, W] -> [B, H, W, D] to apply CLN
+        x = x1 + x2
+        B, D, H, W = x.shape
+        x = x.permute(0, 2, 3, 1)
+        x = self.norm(x, time)
+        x = x.permute(0, 3, 1, 2)
+        
+        out = self.act(x)
         return out
 
 class FNOExpert(nn.Module):
@@ -200,21 +240,17 @@ class FNOExpert(nn.Module):
             FNOBlock(config) for _ in range(config.fno_layers)
         ])
         
-    def forward(self, x):
+    def forward(self, x, time):
         B, N, D = x.shape
         H = W = self.grid_size
         
-        # [B, N, D] -> [B, D, H, W]
         x_grid = x.transpose(1, 2).view(B, D, H, W)
-        
         shortcut = x_grid
+        
         for layer in self.layers:
-            x_grid = layer(x_grid)
+            x_grid = layer(x_grid, time)
         
-        # Residual connection over the whole expert
         x_grid = x_grid + shortcut
-        
-        # [B, D, H, W] -> [B, N, D]
         out = x_grid.flatten(2).transpose(1, 2)
         return out
 
@@ -224,15 +260,16 @@ class MLPBlock(nn.Module):
         super().__init__()
         in_features = config.embed_dim
         hidden_features = int(config.embed_dim * config.mlp_ratio)
-        self.norm = nn.LayerNorm(in_features)
+        # [CHANGE] Use ConditionalLayerNorm
+        self.norm = ConditionalLayerNorm(in_features)
         self.fc1 = nn.Linear(in_features, hidden_features)
         self.act = nn.GELU()
         self.fc2 = nn.Linear(hidden_features, in_features)
         self.drop = nn.Dropout(config.drop_rate)
 
-    def forward(self, x):
+    def forward(self, x, time):
         shortcut = x
-        x = self.norm(x)
+        x = self.norm(x, time)
         x = self.fc1(x)
         x = self.act(x)
         x = self.drop(x)
@@ -247,9 +284,9 @@ class MLPExpert(nn.Module):
             MLPBlock(config) for _ in range(config.mlp_layers)
         ])
         
-    def forward(self, x):
+    def forward(self, x, time):
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, time)
         return x
 
 # --- Swin Expert ---
@@ -262,9 +299,10 @@ class WindowAttnBlock(nn.Module):
         self.grid_size = config.grid_size
         self.mlp_ratio = config.mlp_ratio
         
-        self.norm1 = nn.LayerNorm(self.dim)
+        # [CHANGE] Use ConditionalLayerNorm
+        self.norm1 = ConditionalLayerNorm(self.dim)
         self.attn = nn.MultiheadAttention(embed_dim=self.dim, num_heads=self.num_heads, batch_first=True)
-        self.norm2 = nn.LayerNorm(self.dim)
+        self.norm2 = ConditionalLayerNorm(self.dim)
         self.mlp = nn.Sequential(
             nn.Linear(self.dim, int(self.dim * self.mlp_ratio)),
             nn.GELU(),
@@ -283,12 +321,12 @@ class WindowAttnBlock(nn.Module):
         x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
         return x
     
-    def forward(self, x):
+    def forward(self, x, time):
         shortcut = x
         B, N, C = x.shape
         H = W = self.grid_size
         
-        x_norm = self.norm1(x)
+        x_norm = self.norm1(x, time)
         x_norm = x_norm.view(B, H, W, C)
         
         x_windows = self.window_partition(x_norm, self.window_size) 
@@ -301,7 +339,7 @@ class WindowAttnBlock(nn.Module):
         x_attn = x_attn.view(B, N, C)
         
         x = shortcut + x_attn
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.mlp(self.norm2(x, time))
         return x
 
 class WindowAttentionExpert(nn.Module):
@@ -311,9 +349,9 @@ class WindowAttentionExpert(nn.Module):
             WindowAttnBlock(config) for _ in range(config.swin_layers)
         ])
         
-    def forward(self, x):
+    def forward(self, x, time):
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, time)
         return x
 
 # --- OFormer Expert ---
@@ -326,22 +364,23 @@ class GalerkinBlock(nn.Module):
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
         
-        self.norm1 = nn.LayerNorm(dim)
+        # [CHANGE] Use ConditionalLayerNorm
+        self.norm1 = ConditionalLayerNorm(dim)
         self.qkv = nn.Linear(dim, dim * 3)
         self.proj = nn.Linear(dim, dim)
-        self.ln_k = nn.LayerNorm(head_dim)
+        self.ln_k = nn.LayerNorm(head_dim) # Internal attention norms can stay standard or be upgraded
         self.ln_v = nn.LayerNorm(head_dim)
         
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm2 = ConditionalLayerNorm(dim)
         self.mlp = nn.Sequential(
             nn.Linear(dim, int(dim * config.mlp_ratio)),
             nn.GELU(),
             nn.Linear(int(dim * config.mlp_ratio), dim)
         )
 
-    def forward(self, x):
+    def forward(self, x, time):
         shortcut = x
-        x_norm = self.norm1(x)
+        x_norm = self.norm1(x, time)
         B, N, C = x_norm.shape
         
         qkv = self.qkv(x_norm).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
@@ -358,7 +397,7 @@ class GalerkinBlock(nn.Module):
         attn_out = self.proj(attn_out)
         
         x = shortcut + attn_out
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.mlp(self.norm2(x, time))
         return x
 
 class OFormerExpert(nn.Module):
@@ -368,9 +407,9 @@ class OFormerExpert(nn.Module):
             GalerkinBlock(config) for _ in range(config.oformer_layers)
         ])
         
-    def forward(self, x):
+    def forward(self, x, time):
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, time)
         return x
 
 # --- U-Net Expert (Scaled Width) ---
@@ -379,7 +418,7 @@ class DoubleConv(nn.Module):
         super().__init__()
         self.double_conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(8, out_channels), # GN groups adjusted for larger width
+            nn.GroupNorm(8, out_channels), 
             nn.GELU(),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
             nn.GroupNorm(8, out_channels),
@@ -392,8 +431,8 @@ class DoubleConv(nn.Module):
 class UNetExpert(nn.Module):
     """
     Standard U-Net with 1 downsample stage. 
-    Widths: dim -> dim*2 -> dim. 
-    At dim=256, params approx 11M.
+    Note: Internally uses GroupNorm, so we do not enforce ConditionalLayerNorm 
+    inside the blocks to preserve U-Net structure, but we accept 'time' in forward.
     """
     def __init__(self, config):
         super().__init__()
@@ -409,7 +448,8 @@ class UNetExpert(nn.Module):
         
         self.final = nn.Conv2d(self.dim, self.dim, kernel_size=1)
 
-    def forward(self, x):
+    def forward(self, x, time):
+        # Time is accepted for API consistency but currently not applied in standard U-Net blocks
         B, N, D = x.shape
         H = W = int(N**0.5)
         x_img = x.transpose(1, 2).view(B, D, H, W)
@@ -432,16 +472,17 @@ class KNOBlock(nn.Module):
         super().__init__()
         self.dim = config.embed_dim
         self.lift_dim = self.dim * 2 
-        self.norm = nn.LayerNorm(self.dim)
+        # [CHANGE] Use ConditionalLayerNorm
+        self.norm = ConditionalLayerNorm(self.dim)
         
         self.lift = nn.Linear(self.dim, self.lift_dim)
         self.dynamics = nn.Linear(self.lift_dim, self.lift_dim)
         self.act = nn.GELU()
         self.proj = nn.Linear(self.lift_dim, self.dim)
 
-    def forward(self, x):
+    def forward(self, x, time):
         shortcut = x
-        x_in = self.norm(x)
+        x_in = self.norm(x, time)
         x = self.lift(x_in)
         x = self.act(x)
         x = self.dynamics(x) 
@@ -456,9 +497,9 @@ class KNOExpert(nn.Module):
             KNOBlock(config) for _ in range(config.kno_layers)
         ])
 
-    def forward(self, x):
+    def forward(self, x, time):
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, time)
         return x
 
 # --- WNO Expert ---
@@ -492,19 +533,18 @@ class WNOBlock(nn.Module):
         self.dim = config.embed_dim
         self.wavelet = HaarWavelet2d(self.dim)
         
-        # WNO Block logic: DWT -> Conv(mix bands) -> IDWT
-        # Input channels to Conv is 4 * Dim (LL, LH, HL, HH)
         self.conv = nn.Sequential(
             nn.Conv2d(self.dim * 4, self.dim * 4, kernel_size=3, padding=1, groups=4),
             nn.GELU(),
             nn.Conv2d(self.dim * 4, self.dim * 4, kernel_size=1)
         )
         self.mixing = nn.Linear(self.dim, self.dim)
-        self.norm = nn.LayerNorm(self.dim)
+        # [CHANGE] Use ConditionalLayerNorm
+        self.norm = ConditionalLayerNorm(self.dim)
 
-    def forward(self, x):
+    def forward(self, x, time):
         shortcut = x
-        x_in = self.norm(x)
+        x_in = self.norm(x, time)
         
         B, N, D = x_in.shape
         H = W = int(N**0.5)
@@ -524,9 +564,9 @@ class WNOExpert(nn.Module):
             WNOBlock(config) for _ in range(config.wno_layers)
         ])
     
-    def forward(self, x):
+    def forward(self, x, time):
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, time)
         return x
 
 # ==========================================
@@ -558,12 +598,12 @@ class MoEProcessor(nn.Module):
         
         self.experts = nn.ModuleList([
             FNOExpert(config),             # Expert 0: Fourier
-            MLPExpert(config),             # Expert 1: MLP (Deep)
-            WindowAttentionExpert(config), # Expert 2: Swin (Deep)
-            OFormerExpert(config),         # Expert 3: OFormer (Deep)
-            UNetExpert(config),            # Expert 4: U-Net (Wide)
-            KNOExpert(config),             # Expert 5: KNO (Deep)
-            WNOExpert(config)              # Expert 6: WNO (Deep)
+            MLPExpert(config),             # Expert 1: MLP
+            WindowAttentionExpert(config), # Expert 2: Swin
+            OFormerExpert(config),         # Expert 3: OFormer
+            UNetExpert(config),            # Expert 4: U-Net
+            KNOExpert(config),             # Expert 5: KNO
+            WNOExpert(config)              # Expert 6: WNO
         ])
         
         current_experts = len(self.experts)
@@ -573,7 +613,7 @@ class MoEProcessor(nn.Module):
                 
         self.gating = TopKGating(config)
         
-    def forward(self, x, text_embedding):
+    def forward(self, x, text_embedding, time):
         B, N, D = x.shape
         weights, indices, logits = self.gating(x, text_embedding)
         
@@ -585,8 +625,10 @@ class MoEProcessor(nn.Module):
             
             for expert_idx, expert in enumerate(self.experts):
                 mask = (idx == expert_idx).view(B, 1, 1).float()
-                # Run expert regardless of mask (for DDP stability)
-                expert_out = expert(x)
+                
+                # [CHANGE] Pass time to expert
+                expert_out = expert(x, time)
+                
                 final_output = final_output + w * expert_out * mask
         
         return final_output, logits
@@ -667,6 +709,7 @@ class PoseidonMoE(PreTrainedModel):
                 pixel_values: torch.Tensor, 
                 text_embedding: torch.Tensor, 
                 pixel_mask: torch.Tensor, 
+                time: torch.Tensor, # [CHANGE] Add time input
                 channel_ids: Optional[torch.Tensor] = None, 
                 labels: Optional[torch.Tensor] = None,
                 **kwargs):
@@ -675,10 +718,12 @@ class PoseidonMoE(PreTrainedModel):
             pixel_values, 
             pixel_mask, 
             text_embedding, 
+            time, # [CHANGE] Pass time to encoder
             channel_ids=channel_ids
         )
         
-        latent_output, gate_logits = self.processor(embedding_output, text_embedding)
+        # [CHANGE] Pass time to processor
+        latent_output, gate_logits = self.processor(embedding_output, text_embedding, time)
         
         output = self.decoder(
             latent_output, 

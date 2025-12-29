@@ -11,7 +11,6 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
-# 【新增】引入检查点工具
 from transformers.trainer_utils import get_last_checkpoint
 
 # 确保当前目录在 PYTHONPATH 中
@@ -38,7 +37,13 @@ class ModelArguments:
     top_k: int = field(default=2, metadata={"help": "Top K experts"})
     aux_loss_weight: float = field(default=0.01, metadata={"help": "Weight for load balancing loss"})
     loss_type: str = field(default="mse", metadata={"help": "mse or l1"})
-    
+
+    fno_layers: int = field(default=4, metadata={"help": "Layers for FNO"})
+    mlp_layers: int = field(default=4, metadata={"help": "Layers for MLP"})
+    swin_layers: int = field(default=4, metadata={"help": "Layers for Swin"})
+    oformer_layers: int = field(default=4, metadata={"help": "Layers for OFormer"})
+    kno_layers: int = field(default=4, metadata={"help": "Layers for KNO"})
+    wno_layers: int = field(default=4, metadata={"help": "Layers for WNO"})
     fno_modes: int = field(default=16, metadata={"help": "Modes for FNO"})
     swin_window_size: int = field(default=8, metadata={"help": "Window size for Swin"})
     swin_num_heads: int = field(default=4, metadata={"help": "Num heads for Swin"})
@@ -46,6 +51,8 @@ class ModelArguments:
     
     max_num_channels: int = field(default=256, metadata={"help": "Max number of physical channels"})
     lr_embedding_recovery: float = field(default=1e-3, metadata={"help": "LR for embedding layers"})
+    # 【新增】Poseidon 的时间嵌入学习率
+    lr_time_embedding: float = field(default=None, metadata={"help": "LR for time embedding layers"})
 
 
 @dataclass
@@ -55,9 +62,15 @@ class DataArguments:
     max_train_samples: Optional[int] = field(default=None, metadata={"help": "Limit train samples"})
     max_eval_samples: Optional[int] = field(default=None, metadata={"help": "Limit eval samples"})
     ar_steps: int = field(default=1, metadata={"help": "Autoregressive steps"})
+    
+    # 【新增】Poseidon 对齐的数据集超参数
+    max_num_train_time_steps: Optional[int] = field(default=None, metadata={"help": "Max time steps for training"})
+    train_time_step_size: Optional[int] = field(default=None, metadata={"help": "Time step size for training"})
+    train_small_time_transition: bool = field(default=False, metadata={"help": "Train only for next step prediction (delta t=1)"})
+    move_data: Optional[str] = field(default=None, metadata={"help": "Move data to scratch"})
 
 # ==========================================
-# 2. 自定义 Collator
+# 2. 自定义 Collator - 增加 time 处理
 # ==========================================
 
 def variable_channel_collator(batch):
@@ -76,6 +89,7 @@ def variable_channel_collator(batch):
     
     text_embeddings = []
     labels = []
+    times = []  # 【新增】收集 time
     
     for i, item in enumerate(batch):
         c = item['pixel_values'].shape[0]
@@ -88,6 +102,8 @@ def variable_channel_collator(batch):
             padded_channel_ids[i, :c] = torch.arange(c)
 
         text_embeddings.append(item['text_embedding'])
+        # 【新增】收集 time，如果是 None 则默认为 0.0 (稳健性)
+        times.append(item.get('time', 0.0))
         
         if 'labels' in item:
              padded_lbl = torch.zeros(max_c, H, W)
@@ -99,6 +115,7 @@ def variable_channel_collator(batch):
         "pixel_mask": padded_masks,
         "channel_ids": padded_channel_ids,
         "text_embedding": torch.stack(text_embeddings),
+        "time": torch.tensor(times, dtype=torch.float32), # 【新增】打包 time
         "labels": torch.stack(labels) if len(labels) > 0 else None
     }
     return batch_dict
@@ -133,21 +150,36 @@ def main():
     # 3. 设置随机种子
     set_seed(training_args.seed)
 
-    # 4. 加载数据集
+    # 4. 加载数据集 - 【关键修改】处理 Poseidon 风格的超参数
     logger.info(f"Loading dataset: {data_args.dataset_name}")
     
+    # 构造传递给 get_dataset 的参数字典
+    dataset_kwargs = {}
+    if data_args.max_num_train_time_steps is not None:
+        dataset_kwargs["max_num_time_steps"] = data_args.max_num_train_time_steps
+    if data_args.train_time_step_size is not None:
+        dataset_kwargs["time_step_size"] = data_args.train_time_step_size
+    if data_args.train_small_time_transition:
+        dataset_kwargs["allowed_time_transitions"] = [1] # 强制只学习单步
+    if data_args.move_data is not None:
+        dataset_kwargs["move_to_local_scratch"] = data_args.move_data
+
+    # 获取 Train Set
     train_dataset = get_dataset(
         data_args.dataset_name,
         which="train",
         data_path=data_args.data_path,
         num_trajectories=data_args.max_train_samples if data_args.max_train_samples else -1,
+        **dataset_kwargs # 传入处理后的参数
     )
     
+    # 获取 Eval Set
     eval_dataset = get_dataset(
         data_args.dataset_name,
         which="val",
         data_path=data_args.data_path,
-        num_trajectories=data_args.max_eval_samples if data_args.max_eval_samples else -1
+        num_trajectories=data_args.max_eval_samples if data_args.max_eval_samples else -1,
+        **dataset_kwargs
     )
 
     # 5. 初始化模型
@@ -160,6 +192,12 @@ def main():
         num_experts=model_args.num_experts,
         top_k=model_args.top_k,
         fno_modes=model_args.fno_modes,
+        fno_layers=model_args.fno_layers,
+        mlp_layers=model_args.mlp_layers,
+        swin_layers=model_args.swin_layers,
+        oformer_layers=model_args.oformer_layers,
+        kno_layers=model_args.kno_layers,
+        wno_layers=model_args.wno_layers,
         swin_window_size=model_args.swin_window_size,
         swin_num_heads=model_args.swin_num_heads,
         mlp_ratio=model_args.mlp_ratio
@@ -175,6 +213,7 @@ def main():
     # 注入 Trainer 需要的额外参数
     training_args.ar_steps = data_args.ar_steps
     training_args.learning_rate_embedding_recovery = model_args.lr_embedding_recovery
+    training_args.learning_rate_time_embedding = model_args.lr_time_embedding # 【新增】
     training_args.label_names = ["labels"]
 
     # 6. 初始化 Trainer
@@ -188,36 +227,17 @@ def main():
         aux_loss_weight=model_args.aux_loss_weight,
     )
 
-    # ====================================================
-    # 7. 断点检测逻辑 (仅用于日志提示，不强制续训)
-    # ====================================================
+    # 7. 断点检测逻辑
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
         if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
-            logger.warning(
-                f"Output directory ({training_args.output_dir}) exists and is not empty. "
-                "No valid checkpoint found. Training might fail if overwrite is not allowed."
-            )
-        elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
-            logger.info(
-                f"Checkpoint detected at {last_checkpoint}. "
-                f"To resume training, use '--resume_from_checkpoint' flag."
-            )
+            logger.warning(f"Output directory {training_args.output_dir} is not empty.")
 
     # 8. 开始训练
     if training_args.do_train:
         logger.info("*** Starting Training ***")
-        
-        # 【关键修改】
-        # 不再自动传入 last_checkpoint。
-        # 如果命令行加了 --resume_from_checkpoint，training_args.resume_from_checkpoint 会自动生效。
-        # 如果没加，则从头开始（或因目录非空且未 overwrite 而报错，符合预期）。
-        
-        checkpoint = None
-        if training_args.resume_from_checkpoint is not None:
-            checkpoint = training_args.resume_from_checkpoint
-        
+        checkpoint = training_args.resume_from_checkpoint or last_checkpoint
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         
         trainer.save_model()

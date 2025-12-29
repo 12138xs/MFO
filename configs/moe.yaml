@@ -1,22 +1,32 @@
-# --- Model Architecture ---
+# --- Training and Evaluation Flags ---
+do_train: true
+do_eval: true
+
+# --- Model Architecture (Matches "Upgrade" in model.py) ---
 img_size: 128
 patch_size: 4
-embed_dim: 128
-text_dim: 768
-num_experts: 4
-top_k: 2
-fno_modes: 16
-swin_window_size: 8
-swin_num_heads: 4
-mlp_ratio: 4.0
+embed_dim: 256            # [Upgrade] 提升维度
+text_dim: 768             # 对应 CLIP/BERT 嵌入维度
 max_num_channels: 256
 
-# --- Loss & Optimization ---
-aux_loss_weight: 0.01
-loss_type: "mse"
-lr_embedding_recovery: 1.0e-3
+# --- Mixture of Experts ---
+num_experts: 7            # [Upgrade] FNO, MLP, Swin, OFormer, UNet, KNO, WNO
+top_k: 2                  # 每次激活 2 个专家
+aux_loss_weight: 0.01     # 负载均衡损失权重
 
-# --- Data Arguments ---
+# --- Expert Specifics ---
+fno_modes: 8
+fno_layers: 2
+mlp_layers: 16            # [Upgrade] Deep MLP
+swin_layers: 12           # [Upgrade] Deep Swin
+swin_window_size: 8
+swin_num_heads: 8         # 配合 embed_dim=256
+mlp_ratio: 4.0
+oformer_layers: 12
+kno_layers: 16
+wno_layers: 4
+
+# --- Data & Time Conditioning (Poseidon Alignment) ---
 dataset_name: [
   "fluids.incompressible.Gaussians", 
   "fluids.incompressible.Sines", 
@@ -25,44 +35,45 @@ dataset_name: [
   "fluids.compressible.KelvinHelmholtz",
   "fluids.compressible.Gaussians"
 ] 
-data_path: "/data1/cenjianhuan/UniPDESolver/datasets/"       
-max_train_samples: null
-max_eval_samples: null
-ar_steps: 1
+data_path: "/data1/cenjianhuan/UniPDESolver/datasets/"  
+max_train_samples: null   # 使用全部数据
+max_eval_samples: 500
 
-# --- Training Arguments ---
-output_dir: "./checkpoints/moe_run_final"
-overwrite_output_dir: false     # 【关键修改】设为 false 以支持断点续训
-do_train: true
-do_eval: true
+# [New] Poseidon Time Parameters
+max_num_train_time_steps: null      # 训练时允许的最大时间步长跨度
+train_time_step_size: null          # 最小时间步长单位
+train_small_time_transition: true   # False = 学习任意 Delta t (t->t+k); True = 只学 t->t+1
 
-# Optimization
+# [New] Autoregression
+ar_steps: 1               # 保持为1，除非修改了Dataset支持序列返回
+
+# --- Optimization ---
+loss_type: "mse"          # mse 或 l1
+output_dir: "./checkpoints/moe_poseidon_aligned"
+overwrite_output_dir: true
+
+per_device_train_batch_size: 8
+per_device_eval_batch_size: 8
+gradient_accumulation_steps: 1
+
 learning_rate: 5.0e-4
-optim: "adamw_torch"
 weight_decay: 1.0e-4
-lr_scheduler_type: "cosine"
-warmup_ratio: 0.05
+warmup_steps: 1000
 num_train_epochs: 50
 
-# Batch Size & Performance
-per_device_train_batch_size: 128
-per_device_eval_batch_size: 128
-gradient_accumulation_steps: 1
-fp16: false
-bf16: false
+# [New] Parameter Groups LR
+lr_embedding_recovery: 1.0e-3 # Encoder/Decoder 学习率通常稍大
+lr_time_embedding: 1.0e-3     # [New] 时间嵌入层的学习率
 
-# Logging & Saving
+# --- Logging & Eval ---
 logging_steps: 50
-
-# 【关键修改】策略调整为 epoch，且只保留最新的1个 + 最优的1个
 evaluation_strategy: "epoch"
 save_strategy: "epoch"
-save_total_limit: 1             # 只保留1个最新的 checkpoint
-load_best_model_at_end: true    # 训练结束加载最优模型（并确保最优chkpt不被删除）
-metric_for_best_model: "eval_loss" # 根据 loss 选最优
-greater_is_better: false        # loss 越小越好
+save_total_limit: 3
+load_best_model_at_end: true
+metric_for_best_model: "eval_loss"
 
-# System
-seed: 42
-dataloader_num_workers: 4
-remove_unused_columns: false
+# --- Hardware ---
+fp16: false                    # 开启混合精度
+dataloader_num_workers: 8
+ddp_find_unused_parameters: true # MoE 中有些专家可能未被激活，需要设为 True

@@ -1,5 +1,5 @@
 dataset:
-  value: ["fluids.incompressible.Sines"]
+  value: ["wave.Layer", "fluids.compressible.Riemann"]
 num_trajectories:
   value: 128
 model_name:
