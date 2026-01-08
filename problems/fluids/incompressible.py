@@ -216,7 +216,7 @@ class KolmogorovFlow(BaseTimeDataset):
         self.channel_names = ["u", "v", "g"]
         if not self.just_velocities:
             self.channel_names = ["rho", "u", "v", "p", "g"]
-        if self.tracer:
+        if tracer:
             self.channel_names.append("tracer")
         self.channel_ids_tensor = get_channel_ids(self.channel_names)
 
