@@ -1,0 +1,60 @@
+# --- Finetuning specific ---
+pretrained_model_path: "./checkpoints/finetune/checkpoint-106450"
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.1
+
+# --- Training and Evaluation Flags ---
+do_train: true
+do_eval: true
+
+# --- Model Config (Should match pretrained mostly, used for Args parsing) ---
+img_size: 128
+patch_size: 4
+embed_dim: 256
+text_dim: 768
+max_num_channels: 256
+num_experts: 7
+top_k: 2
+aux_loss_weight: 0.01
+
+# --- Data ---
+# 这里指定下游任务的数据集
+dataset_name: "fluids.incompressible.PiecewiseConstants"
+data_path: "/data1/cenjianhuan/UniPDESolver/datasets/"
+max_train_samples: null
+max_eval_samples: 200
+ar_steps: 1
+
+# --- Optimization ---
+loss_type: "mse"
+output_dir: "./checkpoints/finetune_lora_decoder"
+overwrite_output_dir: true
+
+per_device_train_batch_size: 128
+per_device_eval_batch_size: 128
+gradient_accumulation_steps: 1
+
+max_num_train_time_steps: null      # 训练时允许的最大时间步长跨度
+train_time_step_size: null          # 最小时间步长单位
+train_small_time_transition: true   # False = 学习任意 Delta t (t->t+k); True = 只学 t->t+1
+
+# LoRA 学习率通常比全量微调大
+learning_rate: 1.0e-3
+weight_decay: 0.0
+warmup_steps: 100
+num_train_epochs: 20
+
+# Parameter Groups LR
+lr_embedding_recovery: 1.0e-3
+lr_time_embedding: 1.0e-3
+
+# --- Logging ---
+logging_steps: 10
+evaluation_strategy: "epoch"
+save_strategy: "epoch"
+save_total_limit: 2
+load_best_model_at_end: true
+metric_for_best_model: "eval_loss"
+fp16: false
+dataloader_num_workers: 4

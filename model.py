@@ -128,12 +128,15 @@ class ChannelAwarePatchEncoder(nn.Module):
         self.channel_pos_embed = nn.Embedding(config.max_num_channels, config.embed_dim)
         self.spatial_pos_embed = nn.Parameter(torch.zeros(1, config.num_patches, config.embed_dim))
         self.text_proj = nn.Linear(config.text_dim, config.embed_dim)
+
+        self.embedding_fusion = nn.Linear(config.embed_dim * 2, config.embed_dim)
         
-        # [CHANGE] Use ConditionalLayerNorm
         self.norm = ConditionalLayerNorm(config.embed_dim)
         
         nn.init.trunc_normal_(self.spatial_pos_embed, std=0.02)
         nn.init.trunc_normal_(self.channel_pos_embed.weight, std=0.02)
+        nn.init.trunc_normal_(self.embedding_fusion.weight, std=0.02)
+        nn.init.constant_(self.embedding_fusion.bias, 0)
 
     def forward(self, pixel_values, pixel_mask, text_embedding, time, channel_ids=None):
         B, C, H, W = pixel_values.shape
@@ -157,10 +160,14 @@ class ChannelAwarePatchEncoder(nn.Module):
         x_agg = patches.sum(dim=1) / (mask_expanded.sum(dim=1) + 1e-6)
         
         x_agg = x_agg + self.spatial_pos_embed
-        text_feat = self.text_proj(text_embedding).unsqueeze(1)
-        x = x_agg + text_feat
+
+        text_feat = self.text_proj(text_embedding) 
+        text_feat_expanded = text_feat.unsqueeze(1).expand(-1, N, -1)
+        x_cat = torch.cat([x_agg, text_feat_expanded], dim=-1)
         
-        # [CHANGE] Pass time to norm
+        x = self.embedding_fusion(x_cat)
+        
+        # Pass time to norm
         x = self.norm(x, time)
         return x
 
@@ -179,10 +186,10 @@ class SpectralConv2d(nn.Module):
         self.scale = (1 / (in_channels * out_channels))
         
         self.weights1 = nn.Parameter(
-            self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, 2, dtype=torch.float32)
+            self.scale * torch.randn(in_channels, out_channels, self.modes1, self.modes2, 2, dtype=torch.float32)
         )
         self.weights2 = nn.Parameter(
-            self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, 2, dtype=torch.float32)
+            self.scale * torch.randn(in_channels, out_channels, self.modes1, self.modes2, 2, dtype=torch.float32)
         )
 
     def complex_mul2d(self, input, weights):
@@ -578,14 +585,16 @@ class TopKGating(nn.Module):
         super().__init__()
         self.k = config.top_k
         self.gate = nn.Sequential(
-            nn.Linear(config.embed_dim + config.text_dim, config.embed_dim),
+            nn.Linear(config.embed_dim, config.embed_dim),
             nn.ReLU(),
             nn.Linear(config.embed_dim, config.num_experts)
         )
         
-    def forward(self, x, text_embedding):
+    def forward(self, x):
         x_mean = x.mean(dim=1)
-        decision_feat = torch.cat([x_mean, text_embedding], dim=1)
+        
+        decision_feat = x_mean 
+        
         logits = self.gate(decision_feat)
         top_k_logits, top_k_indices = torch.topk(logits, self.k, dim=1)
         top_k_weights = F.softmax(top_k_logits, dim=1)
@@ -613,9 +622,9 @@ class MoEProcessor(nn.Module):
                 
         self.gating = TopKGating(config)
         
-    def forward(self, x, text_embedding, time):
+    def forward(self, x, time):
         B, N, D = x.shape
-        weights, indices, logits = self.gating(x, text_embedding)
+        weights, indices, logits = self.gating(x)
         
         final_output = torch.zeros_like(x)
         
@@ -626,7 +635,7 @@ class MoEProcessor(nn.Module):
             for expert_idx, expert in enumerate(self.experts):
                 mask = (idx == expert_idx).view(B, 1, 1).float()
                 
-                # [CHANGE] Pass time to expert
+                # Pass time to expert
                 expert_out = expert(x, time)
                 
                 final_output = final_output + w * expert_out * mask
@@ -695,7 +704,12 @@ class PoseidonMoE(PreTrainedModel):
         self.post_init()
 
     def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
+        if isinstance(m, ConditionalLayerNorm):
+            nn.init.constant_(m.weight.weight, 0)
+            nn.init.constant_(m.weight.bias, 1.0)
+            nn.init.constant_(m.bias.weight, 0)
+            nn.init.constant_(m.bias.bias, 0)
+        elif isinstance(m, nn.Linear):
             nn.init.trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
@@ -723,7 +737,7 @@ class PoseidonMoE(PreTrainedModel):
         )
         
         # [CHANGE] Pass time to processor
-        latent_output, gate_logits = self.processor(embedding_output, text_embedding, time)
+        latent_output, gate_logits = self.processor(embedding_output, time)
         
         output = self.decoder(
             latent_output, 
